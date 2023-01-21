@@ -1,0 +1,367 @@
+import Synergex.SynergyDE.Select
+
+.ifdef OS_VMS
+.else
+.define HAS_SEQ_KEYS 1
+.endc
+
+structure Control
+    controlId, i8
+    requestedProcessCount, int
+    startedProcessCount, int
+    finishedProcessCount, int
+    desiredIterations, int
+    maxAccountId, int
+    nextSeed, int
+endstructure
+
+structure SeqControl
+    controlId, i8
+    nextTransactionId, i8
+endstructure
+
+structure Account
+    accountId, i8
+    lastUpdate, i8
+    holderName, a128
+    balance, d28.2
+    noise, a4096
+    lastTransactionId, i8
+    crc, i4
+endstructure
+
+structure Transaction
+    transactionId, i8
+    transactionTime, i8
+    sourceAccountId, i8
+    destAccountId, i8
+    amount, d28.2
+endstructure
+
+subroutine InitializeFiles
+    controlChannel, i4
+    accountCount, int
+    record
+        controlRecord, Control
+        i, int
+        accountChannel, int
+        transactionChannel, int
+        seqControlChannel, int
+        seqControlRecord, SeqControl
+proc
+    init controlRecord
+    init seqControlRecord
+    seqControlRecord.controlId = 1
+    xcall delet("DAT:Accounts")
+    xcall delet("DAT:Transactions")
+    ;;leave control channel locked
+.ifdef HAS_SEQ_KEYS
+
+    isamc("DAT:Accounts, COMPRESS, SGRFA, TBYTE", ^size(Account), 3, 
+    &   "start=1, length=8, type=sequence", 
+    &   "start=19, length=128, type=ALPHA, DUPS", "start=4260, length=8, type=INTEGER, DUPS, MODIFY")
+
+    isamc("DAT:Transactions, COMPRESS, SGRFA", ^size(Transaction), 1, 
+    &   "start=1, length=8, type=sequence")
+.else
+    xcall delet("DAT:SeqControl")
+    isamc("DAT:Accounts, COMPRESS", ^size(Account), 3, 
+    &   "start=1, length=8, type=INTEGER", 
+    &   "start=19, length=128, type=ALPHA, DUPS", "start=4260, length=8, type=INTEGER, DUPS, MODIFY")
+
+    isamc("DAT:Transactions, COMPRESS", ^size(Transaction), 1, 
+    &   "start=1, length=8, type=INTEGER")
+    isamc("DAT:SeqControl, COMPRESS", ^size(SeqControl), 1, 
+    &   "start=1, length=8, type=INTEGER")
+
+    open(seqControlChannel = 0, U:I, "DAT:SeqControl")
+    
+    store(seqControlChannel, seqControlRecord)
+    
+    close(seqControlChannel)
+.endc
+
+    open(accountChannel = 0, U:I, "DAT:Accounts", SHARE: Q_EXCL_RW)
+    open(transactionChannel = 0, U:I, "DAT:Transactions")
+    controlRecord.maxAccountId = accountCount
+    for i from 1 thru accountCount by 1
+    begin
+        xcall InitializeAccount(accountChannel, 999, i)
+    end
+
+    close(accountChannel)
+    close(transactionChannel)
+    controlRecord.startedProcessCount = 0
+    controlRecord.controlId = 1
+    write(controlChannel, controlRecord)
+    xreturn
+endsubroutine
+
+subroutine InitializeAccount
+    accountChannel, int
+    in amount, d28.2
+    in iterationVal, int
+    record
+        targetAccount, Account
+        i, int
+proc
+    targetAccount.balance = amount
+    for i from 1 thru ^size(targetAccount.noise) by 4
+    begin
+        targetAccount.noise(i:4) = LoadTest.Rando.Random()
+    end
+    targetAccount.holderName = "WILLY"+%string(LoadTest.Rando.Random()) + "BOB" + %string(LoadTest.Rando.Random()) + %string(LoadTest.Rando.Random())
+.ifndef HAS_SEQ_KEYS
+    targetAccount.accountId = iterationVal
+.endc
+
+    targetAccount.crc = BlockCRCForData(targetAccount(17:4252), 4252)
+    
+    store(accountChannel, targetAccount)
+    xreturn
+endsubroutine
+
+subroutine AccumulateTotalBalance
+    accountChannel, int
+    out result, d.
+    record
+        accountRecord, Account
+proc
+    foreach accountRecord in new Select(new From(accountChannel, accountRecord))
+    begin
+        result += accountRecord.balance
+        if(%BlockCRCForData(accountRecord(17:4252), 4252) != accountRecord.crc)
+            Console.WriteLine("error in record")
+    end
+    xreturn
+endsubroutine
+
+subroutine ValidateAccountTransactions
+    expectedCount, int
+    record
+        accountRecord, Account
+        transactionRecord, Transaction
+        lastTransactionId, i8
+        transactionChan, int
+proc
+    ;;foreach transaction in transactions orderby transactionid
+    ;;  ensure no duplicates and order is correct
+    ;;  ensure no gaps
+
+    ;;foreach account in accounts
+    ;;  check last transactionid has matching transaction record
+    lastTransactionId = 0
+    foreach transactionRecord in new Select(new From("DAT:Transactions.ISM", transactionRecord), OrderBy.Ascending(transactionRecord.transactionId))
+    begin
+        if(transactionRecord.transactionId - lastTransactionId != 1)
+            Console.WriteLine("invalid transaction sequence detected")
+
+        if(transactionRecord.transactionId > expectedCount)
+            Console.WriteLine("transactionid grew too high")
+
+        lastTransactionId = transactionRecord.transactionId
+    end
+
+    open(transactionChan = 0, I:I, "DAT:Transactions")
+
+    foreach accountRecord in new Select(new From("DAT:Accounts.ISM", accountRecord), OrderBy.Ascending(accountRecord.accountId))
+    begin
+        if(accountRecord.lastTransactionId != 0)
+        begin
+            read(transactionChan, transactionRecord, accountRecord.lastTransactionId, LOCK: Q_NO_LOCK)
+            if(transactionRecord.sourceAccountId != accountRecord.accountId && transactionRecord.destAccountId != accountRecord.accountId)
+            begin
+                Console.WriteLine("transaction record was bound to the wrong account")
+            end
+        end
+    end
+
+    close(transactionChan)
+	xreturn
+endsubroutine
+
+
+subroutine TransferFunds
+    accountChan, int
+    transactionChan, int
+    seqControlChan, int
+    sourceAccountId, i8
+    destAccountId, i8
+    amount, d28.2
+    record work
+        sourceAccount, Account
+        destAccount, Account
+        transactionRecord, Transaction
+        seqControlRecord, SeqControl
+        actualAmountTransfered, d28.2
+        createdTransactionRFA, a10
+proc
+    clear work
+    ;;load/lock both accounts
+    read(accountChan, sourceAccount, sourceAccountId, KEYNUM:0, MATCH: Q_EQ, LOCK: Q_MANUAL_LOCK, WAIT: Q_WAIT)
+    read(accountChan, destAccount, destAccountId, KEYNUM:0, MATCH: Q_EQ, LOCK: Q_MANUAL_LOCK, WAIT: Q_WAIT)
+
+    ;;ensure sufficiant funds
+    if(sourceAccount.balance > amount) then
+    begin
+        actualAmountTransfered = amount
+    end
+    else
+    begin
+        actualAmountTransfered = sourceAccount.balance
+    end
+    
+    sourceAccount.balance -= actualAmountTransfered
+    destAccount.balance += actualAmountTransfered
+    
+    ;;add transaction record
+.ifndef HAS_SEQ_KEYS
+    read(seqControlChan, seqControlRecord, 1, WAIT: Q_WAIT)
+    incr seqControlRecord.nextTransactionId
+    write(seqControlChan, seqControlRecord)
+    transactionRecord.transactionId = seqControlRecord.nextTransactionId
+.endc
+	transactionRecord.destAccountId = destAccount.accountId
+	transactionRecord.sourceAccountId = sourceAccount.accountId
+	transactionRecord.amount = actualAmountTransfered
+
+    store(transactionChan, transactionRecord, GETRFA: createdTransactionRFA)
+    read(transactionChan, transactionRecord, RFA: createdTransactionRFA, WAIT: Q_WAIT, LOCK: Q_NO_LOCK)
+    ;;update last transactionid in both accounts
+    sourceAccount.lastTransactionId = transactionRecord.transactionId
+    destAccount.lastTransactionId = transactionRecord.transactionId
+    ;;update crc both accounts
+    sourceAccount.crc = BlockCRCForData(sourceAccount(17:4252), 4252) 
+    destAccount.crc = BlockCRCForData(destAccount(17:4252), 4252)
+
+    ;;write/unlock both accounts
+    ;;dest was last positioned so we are already on it
+    write(accountChan, destAccount)
+    ;;sourceAccount needs to be positioned to but its already locked with Q_MANUAL_LOCK
+    find(accountChan,, sourceAccountId)
+    write(accountChan, sourceAccount)
+    xcall free(accountChan)
+    xcall free(transactionChan)
+    xreturn
+endsubroutine
+
+subroutine RandomTransfer
+    accountChan, int
+    transactionChan, int
+    seqControlChan, int
+    maxAccountId, int
+    record
+        target1, i8
+        target2, i8
+proc
+    do forever
+    begin
+        target1 = Modulo(LoadTest.Rando.Random(), maxAccountId) + 1
+        target2 = Modulo(LoadTest.Rando.Random(), maxAccountId) + 1
+        if(target1 != target2)
+            exitloop
+    end
+    
+    xcall TransferFunds(accountChan, transactionChan, seqControlChan, target1, target2, 100)
+    xreturn
+endsubroutine
+
+function Modulo, int
+    arg1, int
+    arg2, int
+proc
+    freturn arg1 - arg2 * (arg1 / arg2)
+endfunction
+
+
+;;alphaData length must be divisible by 4
+function BlockCRCForData, int
+    alphaData, a
+    length, i
+    record
+        i, int
+        result, int
+        intData, int
+proc
+    if(%Modulo(length, 4) != 0)
+        throw new Exception("length was not divisible by 4")
+
+    result = 0
+    for i from 1 thru length by 4
+    begin
+        intData = ^i(alphaData(i:4))
+        result = result .bxor. intData 
+        i = length - 4
+    end
+    freturn result
+endfunction
+
+namespace LoadTest
+    class Rando
+        public static Seed1, int
+        public static Seed2, int
+        public static method Random, int
+            record
+                result, int
+        proc
+            xcall randm(result, Seed1, Seed2)
+            mreturn result
+        endmethod
+    endclass
+
+endnamespace
+
+main
+proc
+    begin
+        data controlRecord, Control
+        data controlChannel, i4, 0
+        data accountChannel, i4, 0
+        data transactionChannel, i4, 0
+        data seqControlChannel, i4, 0
+        data totalBalance, d28.2, 0
+        init controlRecord
+.ifdef HAS_SEQ_KEYS
+        isamc("DAT:Control, COMPRESS, SGRFA", ^size(Control), 1, 
+        &    "start=1, length=8, type=sequence")
+.else
+        isamc("DAT:Control, COMPRESS", ^size(Control), 1, 
+        &    "start=1, length=8, type=integer")
+.endc
+
+        open(controlChannel = 0, U:I, "DAT:Control")
+        controlRecord.controlId = 1
+        store(controlChannel, controlRecord)
+
+        read(controlChannel, controlRecord, 1, WAIT:Q_NOWAIT, LOCK:Q_MANUAL_LOCK)
+        xcall InitializeFiles(controlChannel, 10000)
+        begin
+            data i, int
+            data iterations, int, 1000
+            data maxAccountId, i8, 10000
+            open(accountChannel = 0, U:I, "DAT:Accounts")
+            open(transactionChannel = 0, U:I, "DAT:Transactions")
+    .ifndef HAS_SEQ_KEYS
+            open(seqControlChannel = 0, U:I, "DAT:SeqControl")
+    .endc
+
+            for i from 1 thru iterations by 1
+            begin
+                xcall RandomTransfer(accountChannel, transactionChannel, seqControlChannel, maxAccountId)
+            end
+
+            
+            close transactionChannel
+    .ifndef HAS_SEQ_KEYS
+            close seqControlChannel
+    .endc
+        end
+
+
+        xcall AccumulateTotalBalance(accountChannel, totalBalance)
+        close accountChannel
+        Console.WriteLine("Total Balance: " + %string(totalBalance))
+        xcall ValidateAccountTransactions(1000)
+        Console.WriteLine("Validation Finished")
+    end
+endmain
